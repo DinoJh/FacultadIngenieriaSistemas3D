@@ -197,6 +197,20 @@ function matrizNormal3x3(m4) {
     ]);
 }
 
+// Matriz de proyección ortográfica (para mapas de sombras y vistas paralelas)
+function ortografica(left, right, bottom, top, near, far) {
+    const lr = 1.0 / (left - right);
+    const bt = 1.0 / (bottom - top);
+    const nf = 1.0 / (near - far);
+
+    return new Float32Array([
+        -2.0 * lr, 0, 0, 0,
+        0, -2.0 * bt, 0, 0,
+        0, 0, 2.0 * nf, 0,
+        (left + right) * lr, (top + bottom) * bt, (far + near) * nf, 1
+    ]);
+}
+
 /** Operaciones matriciales del mini motor (Paso 16). */
 class Matrix4 {
     static identidad(...args) { return matrizIdentidad(...args); }
@@ -208,6 +222,7 @@ class Matrix4 {
     static rotacionZ(...args) { return rotacionZ(...args); }
     static lookAt(...args) { return lookAt(...args); }
     static perspectiva(...args) { return perspectiva(...args); }
+    static ortografica(...args) { return ortografica(...args); }
     static normal3x3(...args) { return matrizNormal3x3(...args); }
     static compose(position, rotation, scale) {
         const T = traslacion(position.x, position.y, position.z);
@@ -221,7 +236,7 @@ return { Matrix4 };
 
 // --- js/shaders/buildingShaders.js ---
 modules["js/shaders/buildingShaders.js"] = (() => {
-/** Shaders GLSL ES 3.00: materiales, normales e iluminación Blinn-Phong. */
+/** Shaders GLSL ES 3.00: materiales, normales, sombras dinámicas y Blinn-Phong. */
 const vertexShaderSource = `#version 300 es
 layout(location = 0) in vec3 aPosition;
 layout(location = 1) in vec3 aNormal;
@@ -248,6 +263,9 @@ void main() {
 
 const fragmentShaderSource = `#version 300 es
 precision highp float;
+precision mediump int;
+precision lowp sampler2D;
+precision lowp sampler2DShadow;
 
 in vec3 vWorldPos;
 in vec3 vNormal;
@@ -263,10 +281,15 @@ uniform float uSpecularPower;
 // Uniforms de Cámara
 uniform vec3 uCameraPos;
 
-// Iluminación Solar
+// Iluminación Solar / Lunar
 uniform vec3 uSunDirection;
 uniform vec3 uSunColor;
 uniform vec3 uAmbientColor;
+
+// Sombras Proyectadas (Shadow Mapping)
+uniform mat4 uLightSpaceMatrix;
+uniform sampler2DShadow uShadowMap;
+uniform float uShadowIntensity;
 
 // Focos Dicroicos Empotrados Múltiples (Soffit y Pórtico)
 #define MAX_LUCES 7
@@ -278,11 +301,45 @@ uniform float uLuzRadio[MAX_LUCES];
 
 out vec4 fragColor;
 
+float calcularSombra(vec3 worldPos, vec3 N, vec3 L) {
+    if (uShadowIntensity <= 0.01) return 0.0;
+
+    vec4 lightSpacePos = uLightSpaceMatrix * vec4(worldPos, 1.0);
+    vec3 projCoords = lightSpacePos.xyz / lightSpacePos.w;
+    projCoords = projCoords * 0.5 + 0.5;
+
+    // Si está fuera del volumen ortográfico de la luz
+    if (projCoords.z > 1.0 || projCoords.x < 0.0 || projCoords.x > 1.0 || projCoords.y < 0.0 || projCoords.y > 1.0) {
+        return 0.0;
+    }
+
+    float cosTheta = max(dot(N, L), 0.0);
+    // Cara en sombra propia (espalda a la luz)
+    if (cosTheta <= 0.001) return 1.0 * uShadowIntensity;
+
+    float bias = max(0.0035 * (1.0 - cosTheta), 0.0008);
+    float currentDepth = projCoords.z - bias;
+
+    // Filtrado PCF 3x3 para bordes suaves en las sombras del edificio y árboles
+    float shadow = 0.0;
+    vec2 texelSize = vec2(1.0 / 2048.0);
+    for (int x = -1; x <= 1; ++x) {
+        for (int y = -1; y <= 1; ++y) {
+            vec3 coord = vec3(projCoords.xy + vec2(x, y) * texelSize, currentDepth);
+            shadow += 1.0 - texture(uShadowMap, coord);
+        }
+    }
+    shadow /= 9.0;
+    return shadow * uShadowIntensity;
+}
+
 void main() {
-    // Si la pieza es una fuente emisora directa (dicroico encendido o texto neón)
+    // Si la pieza es una fuente emisora directa (Sol, Luna, halos, texto neón o bombillas)
     if (uEmissive) {
-        vec3 colorBase = uUseTexture ? texture(uTexture, vTexCoord).rgb : uColor.rgb;
-        fragColor = vec4(colorBase * 1.5, 1.0);
+        vec4 texColor = uUseTexture ? texture(uTexture, vTexCoord) : vec4(1.0);
+        vec3 colorBase = texColor.rgb * uColor.rgb;
+        float alfa = uColor.a * texColor.a;
+        fragColor = vec4(colorBase * 1.35, alfa);
         return;
     }
 
@@ -292,17 +349,35 @@ void main() {
     vec3 N = normalize(vNormal);
     vec3 V = normalize(uCameraPos - vWorldPos);
 
-    // 1. Luz Ambiental
-    vec3 ambiente = uAmbientColor * albedo;
+    // 1. Luz Ambiental Hemisférica (Cielo cenital vs Rebote del suelo)
+    // Superficies mirando al cielo (+Y) reciben la luz ambiental de la bóveda celeste.
+    // Superficies mirando hacia abajo (-Y) reciben el rebote atenuado y cálido del terreno.
+    float factorHemi = clamp(N.y * 0.5 + 0.5, 0.0, 1.0);
+    vec3 ambientCielo = uAmbientColor;
+    vec3 ambientSuelo = uAmbientColor * vec3(0.55, 0.50, 0.45) * 0.75;
+    vec3 ambiente = mix(ambientSuelo, ambientCielo, factorHemi) * albedo;
 
-    // 2. Luz Solar Direccional
+    // 2. Luz Solar / Lunar Direccional con Sombras
+    // L_sol apunta hacia la fuente de luz
     vec3 L_sol = normalize(-uSunDirection);
-    float diffSol = max(dot(N, L_sol), 0.0);
-    vec3 difusaSol = uSunColor * diffSol * albedo;
+    float NdotL = max(dot(N, L_sol), 0.0);
 
+    // Cálculo de sombra arrojada (Shadow Mapping con PCF)
+    float factorSombra = calcularSombra(vWorldPos, N, L_sol);
+    float factorLuzDirecta = NdotL * (1.0 - factorSombra);
+
+    vec3 difusaSol = uSunColor * factorLuzDirecta * albedo;
+
+    // Especular Blinn-Phong con efecto Fresnel (Schlick)
     vec3 H_sol = normalize(L_sol + V);
-    float specSol = pow(max(dot(N, H_sol), 0.0), uSpecularPower);
-    vec3 especularSol = uSunColor * specSol * (uSpecularPower > 25.0 ? 0.35 : 0.08);
+    float NdotH = max(dot(N, H_sol), 0.0);
+    float specSol = pow(NdotH, max(uSpecularPower, 4.0));
+
+    // Efecto Fresnel: a ángulos rasantes los vidrios y metales reflejan más luz
+    float VdotH = max(dot(V, H_sol), 0.0);
+    float fresnel = 0.04 + 0.96 * pow(clamp(1.0 - VdotH, 0.0, 1.0), 5.0);
+    float factorEspecular = uSpecularPower > 25.0 ? (0.35 + 0.50 * fresnel) : (0.08 + 0.12 * fresnel);
+    vec3 especularSol = uSunColor * (specSol * (1.0 - factorSombra)) * factorEspecular;
 
     // 3. Focos Dicroicos Empotrados (Cálculo acumulativo con atenuación cuadrática suave)
     vec3 luzDicroicosTotal = vec3(0.0);
@@ -330,11 +405,16 @@ void main() {
         }
     }
 
-    vec3 colorFinal = ambiente + difusaSol + especularSol + luzDicroicosTotal;
+    // 4. Composición Lumínica y Mapeo Tonal (Tonemapping)
+    vec3 colorIluminado = ambiente + difusaSol + especularSol + luzDicroicosTotal;
+
+    // Curva de mapeo tonal tipo Reinhard extendido para evitar quemado blanco
+    vec3 colorMapeado = colorIluminado / (colorIluminado + vec3(0.75)) * 1.20;
+    vec3 colorFinal = clamp(colorMapeado, 0.0, 1.0);
+
     fragColor = vec4(colorFinal, uColor.a * texColor.a);
 }
 `;
-
 
 return { vertexShaderSource, fragmentShaderSource };
 })();
@@ -344,7 +424,21 @@ modules["js/core/Renderer.js"] = (() => {
 const { Matrix4 } = modules["js/math/Matrix4.js"];
 const { vertexShaderSource, fragmentShaderSource } = modules["js/shaders/buildingShaders.js"];
 
-/** Traduce Scene + Camera a WebGL2. No conoce paredes, puertas ni controles. */
+const shadowVsSource = `#version 300 es
+layout(location = 0) in vec3 aPosition;
+uniform mat4 uLightSpaceMatrix;
+uniform mat4 uModelMatrix;
+void main() {
+    gl_Position = uLightSpaceMatrix * uModelMatrix * vec4(aPosition, 1.0);
+}
+`;
+
+const shadowFsSource = `#version 300 es
+precision highp float;
+void main() {}
+`;
+
+/** Traduce Scene + Camera a WebGL2 con iluminación y sombras dinámicas. */
 class Renderer {
     constructor(canvas) {
         this.canvas = canvas;
@@ -353,11 +447,16 @@ class Renderer {
         this.gl = gl;
         this.geometries = new Map();
         this.info = { drawCalls: 0 };
+
         gl.enable(gl.DEPTH_TEST);
         gl.depthFunc(gl.LEQUAL);
         gl.enable(gl.CULL_FACE);
         gl.cullFace(gl.BACK);
-        this.program = this.createProgram();
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+        // Programa principal de renderizado
+        this.program = this.createProgramWithShaders(vertexShaderSource, fragmentShaderSource);
         const location = name => gl.getUniformLocation(this.program, name);
         this.uniforms = {
             modelLoc: location('uModelMatrix'), viewLoc: location('uViewMatrix'),
@@ -367,11 +466,38 @@ class Renderer {
             specularPowerLoc: location('uSpecularPower'), cameraPosLoc: location('uCameraPos'),
             sunDirLoc: location('uSunDirection'), sunColorLoc: location('uSunColor'),
             ambientColorLoc: location('uAmbientColor'), numLucesLoc: location('uNumLuces'),
+            lightSpaceMatrixLoc: location('uLightSpaceMatrix'),
+            shadowMapLoc: location('uShadowMap'),
+            shadowIntensityLoc: location('uShadowIntensity'),
             lights: Array.from({ length: 7 }, (_, i) => ({
                 position: location(`uLuzPos[${i}]`), color: location(`uLuzColor[${i}]`),
                 intensity: location(`uLuzIntensidad[${i}]`), radius: location(`uLuzRadio[${i}]`)
             }))
         };
+
+        // Programa y FBO para mapas de sombras proyectadas (Shadow Mapping)
+        this.shadowProgram = this.createProgramWithShaders(shadowVsSource, shadowFsSource);
+        this.shadowUniforms = {
+            lightSpaceMatrixLoc: gl.getUniformLocation(this.shadowProgram, 'uLightSpaceMatrix'),
+            modelLoc: gl.getUniformLocation(this.shadowProgram, 'uModelMatrix')
+        };
+
+        this.shadowSize = 2048;
+        this.shadowDepth = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, this.shadowDepth);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, this.shadowSize, this.shadowSize, 0,
+            gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL);
+
+        this.shadowFbo = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.shadowFbo);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, this.shadowDepth, 0);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     }
 
     createShader(type, source) {
@@ -387,10 +513,10 @@ class Renderer {
         return shader;
     }
 
-    createProgram() {
+    createProgramWithShaders(vsSource, fsSource) {
         const gl = this.gl;
-        const vs = this.createShader(gl.VERTEX_SHADER, vertexShaderSource);
-        const fs = this.createShader(gl.FRAGMENT_SHADER, fragmentShaderSource);
+        const vs = this.createShader(gl.VERTEX_SHADER, vsSource);
+        const fs = this.createShader(gl.FRAGMENT_SHADER, fsSource);
         const program = gl.createProgram();
         gl.attachShader(program, vs);
         gl.attachShader(program, fs);
@@ -444,23 +570,65 @@ class Renderer {
     render(scene, camera) {
         const gl = this.gl;
         const u = this.uniforms;
+
+        scene.updateMatrixWorld();
+        camera.updateViewMatrix();
+
+        const light = scene.lighting;
+        const sunDir = light.sunDirection || [-0.6, -0.8, -0.4];
+
+        // 1. CÁLCULO DE LA MATRIZ DE ESPACIO DE LUZ (Para sombras del Sol)
+        const distLuz = 80.0;
+        const centroEscena = [0.0, 5.0, 0.0];
+        const eyeLuz = [
+            centroEscena[0] - sunDir[0] * distLuz,
+            centroEscena[1] - sunDir[1] * distLuz,
+            centroEscena[2] - sunDir[2] * distLuz
+        ];
+        const upLuz = Math.abs(sunDir[1]) > 0.95 ? [0, 0, 1] : [0, 1, 0];
+        const lightView = Matrix4.lookAt(eyeLuz, centroEscena, upLuz);
+        const lightProj = Matrix4.ortografica(-48, 48, -35, 45, 10, 170);
+        const lightSpaceMatrix = Matrix4.multiplicar(lightProj, lightView);
+
+        // 2. PASO DE SOMBRAS (Genera el mapa de profundidad cuando hay luz solar activa)
+        const shadowIntensity = light.shadowIntensity !== undefined ? light.shadowIntensity : 0.82;
+        if (shadowIntensity > 0.01) {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, this.shadowFbo);
+            gl.viewport(0, 0, this.shadowSize, this.shadowSize);
+            gl.clear(gl.DEPTH_BUFFER_BIT);
+            gl.useProgram(this.shadowProgram);
+            gl.uniformMatrix4fv(this.shadowUniforms.lightSpaceMatrixLoc, false, lightSpaceMatrix);
+            this.renderShadowObject(scene);
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        }
+
+        // 3. PASO PRINCIPAL DE COLOR
         const aspect = this.resize();
         if (camera.aspect !== aspect) {
             camera.aspect = aspect;
             camera.updateProjectionMatrix();
         }
-        scene.updateMatrixWorld();
-        camera.updateViewMatrix();
+
         gl.clearColor(...scene.background);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
         gl.useProgram(this.program);
         gl.uniformMatrix4fv(u.viewLoc, false, camera.viewMatrix);
         gl.uniformMatrix4fv(u.projectionLoc, false, camera.projectionMatrix);
         gl.uniform3f(u.cameraPosLoc, camera.matrixWorld[12], camera.matrixWorld[13], camera.matrixWorld[14]);
-        const light = scene.lighting;
+
         gl.uniform3fv(u.sunDirLoc, light.sunDirection);
         gl.uniform3fv(u.sunColorLoc, light.sunColor);
         gl.uniform3fv(u.ambientColorLoc, light.ambientColor);
+
+        // Uniforms de sombras
+        gl.uniformMatrix4fv(u.lightSpaceMatrixLoc, false, lightSpaceMatrix);
+        gl.uniform1f(u.shadowIntensityLoc, shadowIntensity);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, this.shadowDepth);
+        gl.uniform1i(u.shadowMapLoc, 1);
+
+        // Luces puntuales dicroicas
         const lights = light.pointLights.slice(0, u.lights.length);
         gl.uniform1i(u.numLucesLoc, lights.length);
         lights.forEach((point, i) => {
@@ -469,8 +637,21 @@ class Renderer {
             gl.uniform1f(u.lights[i].intensity, point.intensity);
             gl.uniform1f(u.lights[i].radius, point.radius);
         });
+
         this.info.drawCalls = 0;
         this.renderObject(scene);
+    }
+
+    renderShadowObject(object) {
+        if (!object.visible) return;
+        if (object.geometry && object.material && !object.material.emissive) {
+            const resource = this.initGeometry(object.geometry);
+            this.gl.uniformMatrix4fv(this.shadowUniforms.modelLoc, false, object.matrixWorld);
+            this.gl.bindVertexArray(resource.vao);
+            this.gl.drawElements(this.gl.TRIANGLES, object.geometry.indexCount, this.gl.UNSIGNED_SHORT, 0);
+            this.gl.bindVertexArray(null);
+        }
+        for (const child of object.children) this.renderShadowObject(child);
     }
 
     renderObject(object) {
@@ -484,18 +665,24 @@ class Renderer {
         const u = this.uniforms;
         const material = mesh.material;
         const resource = this.initGeometry(mesh.geometry);
+
+        if (material.depthWrite === false) gl.depthMask(false);
         gl.uniformMatrix4fv(u.modelLoc, false, mesh.matrixWorld);
         gl.uniformMatrix3fv(u.normalMatrixLoc, false, Matrix4.normal3x3(mesh.matrixWorld));
         gl.uniform4fv(u.colorLoc, material.color);
         gl.uniform1i(u.emissiveLoc, material.emissive ? 1 : 0);
         gl.uniform1f(u.specularPowerLoc, material.shininess);
         gl.uniform1i(u.useTextureLoc, material.texture ? 1 : 0);
+
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, material.texture);
         gl.uniform1i(u.textureLoc, 0);
+
         gl.bindVertexArray(resource.vao);
         gl.drawElements(gl.TRIANGLES, mesh.geometry.indexCount, gl.UNSIGNED_SHORT, 0);
         gl.bindVertexArray(null);
+
+        if (material.depthWrite === false) gl.depthMask(true);
         this.info.drawCalls++;
     }
 
@@ -506,6 +693,9 @@ class Renderer {
             this.gl.deleteBuffer(ebo);
         }
         this.geometries.clear();
+        this.gl.deleteTexture(this.shadowDepth);
+        this.gl.deleteFramebuffer(this.shadowFbo);
+        this.gl.deleteProgram(this.shadowProgram);
         this.gl.deleteProgram(this.program);
     }
 }
@@ -779,11 +969,12 @@ return { Mesh };
 modules["js/materials/BasicMaterial.js"] = (() => {
 /** Apariencia de un Mesh; no contiene posiciones ni llamadas a WebGL. */
 class BasicMaterial {
-    constructor({ texture = null, color = [1, 1, 1, 1], emissive = false, shininess = 16 } = {}) {
+    constructor({ texture = null, color = [1, 1, 1, 1], emissive = false, shininess = 16, depthWrite = true } = {}) {
         this.texture = texture;
         this.color = color;
         this.emissive = emissive;
         this.shininess = shininess;
+        this.depthWrite = depthWrite;
     }
 }
 
@@ -2334,37 +2525,16 @@ return { Montana };
 
 // --- js/scenes/Lighting.js ---
 modules["js/scenes/Lighting.js"] = (() => {
-/** Ubicación de las luminarias del edificio; el Renderer solo conoce sus datos. */
-const focos = [
-    { position: [-5.7, 3.92, 2.25], radius: 7.5 },
-    { position: [-4.5, 3.92, 2.25], radius: 7.5 },
-    { position: [-3.3, 3.92, 2.25], radius: 7.5 },
-    { position: [-0.20, 7.70, 0.35], radius: 8.5 },
-    { position: [0.85, 7.70, 0.35], radius: 8.5 },
-    { position: [1.90, 7.70, 0.35], radius: 8.5 },
-    { position: [0.80, 14.10, 0.50], radius: 9.0 }
-];
-
-function actualizarIluminacion(scene, nocturna) {
-    scene.background = nocturna ? [0.03, 0.04, 0.08, 1] : [0.50, 0.68, 0.88, 1];
-    scene.lighting = {
-        sunDirection: nocturna ? [-0.3, -0.85, -0.3] : [-0.6, -0.8, -0.4],
-        sunColor: nocturna ? [0.10, 0.13, 0.22] : [0.98, 0.96, 0.92],
-        ambientColor: nocturna ? [0.07, 0.08, 0.12] : [0.38, 0.40, 0.44],
-        pointLights: focos.map(foco => ({ ...foco, color: [1, 0.95, 0.82], intensity: nocturna ? 4.5 : 2.2 }))
-    };
-}
-
-return { focos, actualizarIluminacion };
-})();
-
-// --- js/objects/SistemaCeleste.js ---
-modules["js/objects/SistemaCeleste.js"] = (() => {
-const { Object3D } = modules["js/core/Object3D.js"];
-const { Mesh } = modules["js/objects/Mesh.js"];
-const { BasicMaterial } = modules["js/materials/BasicMaterial.js"];
-const { SphereGeometry } = modules["js/geometries/SphereGeometry.js"];
-const { focos } = modules["js/scenes/Lighting.js"];
+/**
+ * ============================================================================
+ * PROYECTO 3D: RECREACIÓN DE LA ESCENA DE INGENIERÍA DE SISTEMAS - UNA PUNO
+ * Computación Gráfica 2026-II
+ *
+ * ARCHIVO: js/scenes/Lighting.js
+ * Sistema unificado de fotometría, dispersión atmosférica e iluminación
+ * arquitectónica para el ciclo solar y lunar.
+ * ============================================================================
+ */
 
 function lerp(a, b, t) {
     return a + (b - a) * t;
@@ -2378,12 +2548,212 @@ function clamp(v, min, max) {
     return Math.max(min, Math.min(max, v));
 }
 
+/** Ubicación de las luminarias dicroicas del edificio; el Renderer solo conoce sus datos. */
+const focos = [
+    { position: [-5.7, 3.92, 2.25], radius: 7.5 },
+    { position: [-4.5, 3.92, 2.25], radius: 7.5 },
+    { position: [-3.3, 3.92, 2.25], radius: 7.5 },
+    { position: [-0.20, 7.70, 0.35], radius: 8.5 },
+    { position: [0.85, 7.70, 0.35], radius: 8.5 },
+    { position: [1.90, 7.70, 0.35], radius: 8.5 },
+    { position: [0.80, 14.10, 0.50], radius: 9.0 }
+];
+
 /**
- * Sistema celeste con Sol radiante, Luna llena con textura lunar y campo de estrellas.
- * Implementa el ciclo diurno-nocturno con órbita continua y transición suave de luz y cielo.
+ * Calcula con base física la iluminación solar, lunar, atmosférica y artificial.
+ *
+ * Fases del ciclo solar según ángulo en radianes:
+ * - PI * 0.5 = Mediodía (Sol en el cenit, luz blanca-dorada brillante, sombras cortas)
+ * - PI = Atardecer / Ocaso (Hora dorada, dispersión de Rayleigh, tonos ámbar-rojizos)
+ * - PI * 1.5 = Medianoche (Luna en el cenit, luz plateada fría, sutiles brillos)
+ * - 0 o 2*PI = Amanecer (Luz cálida matinal)
+ *
+ * @param {number} angulo - Ángulo orbital solar en radianes [0, 2*PI]
+ * @param {Object} [centroOrbita={x:0, y:3, z:-18}] - Centro de la trayectoria elíptica
+ * @param {number} [radioOrbita=94.0] - Radio orbital de los astros
+ * @returns {Object} Iluminación completa: { sunDirection, sunColor, ambientColor, background, pointLights, datosSol, datosLuna }
+ */
+function calcularIluminacionCeleste(angulo, centroOrbita = { x: 0, y: 3, z: -18 }, radioOrbita = 94.0) {
+    // 1. Coordenadas orbitales del Sol
+    const solX = centroOrbita.x + Math.cos(angulo) * radioOrbita;
+    const solY = centroOrbita.y + Math.sin(angulo) * radioOrbita;
+    const solZ = centroOrbita.z + Math.sin(angulo * 0.5) * 16.0;
+
+    // 2. Coordenadas orbitales de la Luna (opuesta diametralmente a 180° / PI)
+    const angLuna = angulo + Math.PI;
+    const lunaX = centroOrbita.x + Math.cos(angLuna) * radioOrbita;
+    const lunaY = centroOrbita.y + Math.sin(angLuna) * radioOrbita;
+    const lunaZ = centroOrbita.z + Math.sin(angLuna * 0.5) * 16.0;
+
+    // Altura trigonométrica relativa de los astros (-1 a +1)
+    const sinSol = Math.sin(angulo);
+    const sinLuna = -sinSol;
+
+    // 3. FACTORES DE TRANSICIÓN ATMOSFÉRICA
+    // Factor de día pleno: 1.0 (mediodía), 0.0 (noche)
+    const factorDia = clamp((sinSol + 0.10) / 0.60, 0.0, 1.0);
+
+    // Factor de hora dorada / ocaso (pico cuando el sol toca la línea del horizonte)
+    const factorOcaso = Math.max(0.0, 1.0 - Math.abs(sinSol) * 3.8);
+
+    // Factor nocturno: 1.0 (luna alta en medianoche), 0.0 (día pleno)
+    const factorNoche = clamp((sinLuna + 0.10) / 0.60, 0.0, 1.0);
+
+    // Extinción atmosférica al acercarse al horizonte (impide luz desde el subsuelo)
+    const atenuacionHorizonteSol = clamp(solY / 10.0, 0.0, 1.0);
+    const atenuacionHorizonteLuna = clamp(lunaY / 10.0, 0.0, 1.0);
+
+    // 4. COLOR DE LA BÓVEDA CELESTE (Background)
+    // Cielo diurno: azul límpido de alta montaña (altitud Altiplano Puno ~3820 msnm)
+    const cieloDiaCenit = [0.38, 0.60, 0.88, 1.0];
+    const cieloDiaMedio = [0.50, 0.70, 0.92, 1.0];
+    const cieloDia = lerpVec3(cieloDiaMedio, cieloDiaCenit, clamp(sinSol, 0.0, 1.0));
+
+    // Crepúsculo: dispersión cromática con horizonte ámbar/salmón
+    const cieloOcaso = [0.86, 0.46, 0.28, 1.0];
+    // Hora azul (blue hour) intermedia entre el ocaso y la noche cerrada
+    const cieloHoraAzul = [0.08, 0.12, 0.24, 1.0];
+    // Noche estrellada: azul índigo luminoso (no negro cerrado, para visibilidad clara)
+    const cieloNoche = [0.06, 0.09, 0.18, 1.0];
+
+    let cieloActual = lerpVec3(cieloNoche, cieloDia, factorDia);
+    if (factorOcaso > 0.01) {
+        cieloActual = lerpVec3(cieloActual, cieloOcaso, factorOcaso * 0.78);
+    } else if (sinSol < 0.05 && sinSol > -0.25) {
+        const factorHoraAzul = clamp((0.05 - sinSol) / 0.30, 0.0, 1.0);
+        cieloActual = lerpVec3(cieloActual, cieloHoraAzul, factorHoraAzul * 0.55);
+    }
+    const background = [cieloActual[0], cieloActual[1], cieloActual[2], 1.0];
+
+    // 5. VECTOR DIRECCIONAL Y COLOR DE LA LUZ PRINCIPAL (Sol / Luna)
+    let dirLuz;
+    let colorLuzActual;
+
+    const lenSol = Math.hypot(solX, solY, solZ) || 1.0;
+    const dirHaciaSol = [-solX / lenSol, -solY / lenSol, -solZ / lenSol];
+
+    const lenLuna = Math.hypot(lunaX, lunaY, lunaZ) || 1.0;
+    const dirHaciaLuna = [-lunaX / lenLuna, -lunaY / lenLuna, -lunaZ / lenLuna];
+
+    // Curvas cromáticas solares (luz potente con marcado contraste y sombras definidas)
+    const luzSolCenit = [1.25, 1.20, 1.12]; // Blanco dorado radiante
+    const luzSolDia = [1.12, 1.06, 0.98];   // Luz diurna directa nítida
+    const luzSolOcaso = [1.18, 0.60, 0.22]; // Ámbar dorado crepuscular
+
+    // Curvas cromáticas lunares (luz clara azul-plata que no deja la escena a oscuras)
+    const luzLunaCenit = [0.42, 0.50, 0.65]; // Luz de luna llena clara y envolvente
+    const luzLunaBaja = [0.28, 0.35, 0.48];
+
+    if (sinSol >= -0.05) {
+        // Sol como astro director
+        dirLuz = dirHaciaSol;
+        let colorSol = lerpVec3(luzSolOcaso, luzSolDia, clamp(sinSol / 0.5, 0.0, 1.0));
+        colorSol = lerpVec3(colorSol, luzSolCenit, clamp((sinSol - 0.5) / 0.5, 0.0, 1.0));
+        if (factorOcaso > 0.01) {
+            colorSol = lerpVec3(colorSol, luzSolOcaso, factorOcaso * 0.85);
+        }
+        const intens = atenuacionHorizonteSol;
+        colorLuzActual = [colorSol[0] * intens, colorSol[1] * intens, colorSol[2] * intens];
+    } else {
+        // Luna como astro director nocturno
+        dirLuz = dirHaciaLuna;
+        const colorLuna = lerpVec3(luzLunaBaja, luzLunaCenit, clamp(sinLuna, 0.0, 1.0));
+        const intens = atenuacionHorizonteLuna;
+        colorLuzActual = [colorLuna[0] * intens, colorLuna[1] * intens, colorLuna[2] * intens];
+    }
+
+    // 6. LUZ AMBIENTAL HEMISFÉRICA
+    // De día: ambiente azulado que contrasta con la luz dorada solar
+    const ambientDia = [0.32, 0.36, 0.42];
+    const ambientOcaso = [0.28, 0.22, 0.20];
+    // De noche: ambiente generoso azulino-plateado para que la escena no se vea oscura
+    const ambientNoche = [0.20, 0.24, 0.32];
+
+    let ambientActual = lerpVec3(ambientNoche, ambientDia, factorDia);
+    if (factorOcaso > 0.01) {
+        ambientActual = lerpVec3(ambientActual, ambientOcaso, factorOcaso * 0.70);
+    }
+
+    // Intensidad de sombras: alta de día (sombras solares nítidas), nula/mínima de noche
+    const shadowIntensity = factorDia > 0.05 ? clamp((sinSol + 0.05) / 0.35, 0.0, 0.82) : 0.0;
+
+    // 7. LUMINARIAS DICROICAS ARQUITECTÓNICAS
+    // Se encienden con tono cálido halógeno de 3000K, destacando sobre el ambiente nocturno
+    const intensFocos = lerp(5.0, 0.8, factorDia);
+
+    return {
+        sunDirection: dirLuz,
+        sunColor: colorLuzActual,
+        ambientColor: ambientActual,
+        shadowIntensity: shadowIntensity,
+        background: background,
+        pointLights: focos.map(foco => ({
+            ...foco,
+            color: [1.0, 0.94, 0.82],
+            intensity: intensFocos
+        })),
+        datosSol: {
+            x: solX, y: solY, z: solZ,
+            visible: solY > -2.0,
+            factorDia,
+            factorOcaso,
+            atenuacionHorizonte: atenuacionHorizonteSol
+        },
+        datosLuna: {
+            x: lunaX, y: lunaY, z: lunaZ,
+            visible: lunaY > -2.0,
+            factorNoche,
+            atenuacionHorizonte: atenuacionHorizonteLuna
+        }
+    };
+}
+
+/**
+ * Actualiza la iluminación de una escena para un modo día o noche discreto.
+ * Reutiliza el cálculo fotométrico completo para garantizar consistencia.
+ *
+ * @param {Object} scene - Objeto Scene de la aplicación
+ * @param {boolean} nocturna - True para noche (luna en cenit), false para día (sol en cenit)
+ */
+function actualizarIluminacion(scene, nocturna) {
+    const angulo = nocturna ? Math.PI * 1.5 : Math.PI * 0.5;
+    const ilum = calcularIluminacionCeleste(angulo);
+    scene.background = ilum.background;
+    scene.lighting = {
+        sunDirection: ilum.sunDirection,
+        sunColor: ilum.sunColor,
+        ambientColor: ilum.ambientColor,
+        shadowIntensity: ilum.shadowIntensity,
+        pointLights: ilum.pointLights
+    };
+}
+
+return { focos, calcularIluminacionCeleste, actualizarIluminacion };
+})();
+
+// --- js/objects/SistemaCeleste.js ---
+modules["js/objects/SistemaCeleste.js"] = (() => {
+const { Object3D } = modules["js/core/Object3D.js"];
+const { Mesh } = modules["js/objects/Mesh.js"];
+const { BasicMaterial } = modules["js/materials/BasicMaterial.js"];
+const { SphereGeometry } = modules["js/geometries/SphereGeometry.js"];
+const { calcularIluminacionCeleste } = modules["js/scenes/Lighting.js"];
+
+function lerp(a, b, t) {
+    return a + (b - a) * t;
+}
+
+function lerpVec4(a, b, t) {
+    return [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t), lerp(a[3], b[3], t)];
+}
+
+/**
+ * Sistema celeste con Sol radiante (textura y corona solar), Luna llena plateada
+ * con mares basálticos y campo de estrellas titilantes.
+ * Coordina el ciclo diurno-nocturno delegando el cálculo fotométrico a Lighting.js.
  */
 class SistemaCeleste extends Object3D {
-    constructor(scene, texturas) {
+    constructor(scene, texturas = {}) {
         super('Sistema Celeste');
         this.scene = scene;
         this.radioOrbita = 94.0;
@@ -2399,37 +2769,40 @@ class SistemaCeleste extends Object3D {
         this.autoCiclo = true;
         this.velocidadCiclo = 0.085; // Un ciclo completo dura aprox. 74 segundos
 
-        // 1. Sol 3D y halo radiante
-        const geomSol = new SphereGeometry(3.6, 14, 18);
+        // 1. Sol 3D con textura de plasma incandescente y halo radiante
+        const geomSol = new SphereGeometry(3.8, 18, 22);
         const matSol = new BasicMaterial({
-            color: [1.0, 0.96, 0.55, 1.0],
+            texture: texturas?.sol || null,
+            color: [1.0, 0.98, 0.88, 1.0],
             emissive: true
         });
         this.meshSol = new Mesh(geomSol, matSol, 'Sol');
         this.add(this.meshSol);
 
-        const geomHaloSol = new SphereGeometry(5.0, 10, 14);
+        const geomHaloSol = new SphereGeometry(6.2, 14, 18);
         const matHaloSol = new BasicMaterial({
-            color: [1.0, 0.82, 0.25, 0.45],
-            emissive: true
+            color: [1.0, 0.88, 0.38, 0.32],
+            emissive: true,
+            depthWrite: false
         });
         this.meshHaloSol = new Mesh(geomHaloSol, matHaloSol, 'Halo Solar');
         this.add(this.meshHaloSol);
 
-        // 2. Luna 3D con textura procedimental y halo plateado
-        const geomLuna = new SphereGeometry(2.7, 14, 18);
+        // 2. Luna 3D con textura procedimental y halo plateado etéreo
+        const geomLuna = new SphereGeometry(2.8, 18, 22);
         const matLuna = new BasicMaterial({
-            texture: texturas.luna,
-            color: [0.94, 0.96, 1.0, 1.0],
+            texture: texturas?.luna || null,
+            color: [0.96, 0.98, 1.0, 1.0],
             emissive: true
         });
         this.meshLuna = new Mesh(geomLuna, matLuna, 'Luna');
         this.add(this.meshLuna);
 
-        const geomHaloLuna = new SphereGeometry(3.7, 10, 14);
+        const geomHaloLuna = new SphereGeometry(4.4, 14, 18);
         const matHaloLuna = new BasicMaterial({
-            color: [0.65, 0.78, 1.0, 0.35],
-            emissive: true
+            color: [0.65, 0.80, 1.0, 0.28],
+            emissive: true,
+            depthWrite: false
         });
         this.meshHaloLuna = new Mesh(geomHaloLuna, matHaloLuna, 'Halo Lunar');
         this.add(this.meshHaloLuna);
@@ -2438,15 +2811,15 @@ class SistemaCeleste extends Object3D {
         this.estrellas = [];
         const geomEstrella = new SphereGeometry(0.32, 6, 8);
         const matEstrella = new BasicMaterial({
-            color: [0.95, 0.98, 1.0, 1.0],
+            color: [0.96, 0.98, 1.0, 1.0],
             emissive: true
         });
 
-        const numEstrellas = 84;
+        const numEstrellas = 110;
         for (let i = 0; i < numEstrellas; i++) {
             const theta = (i * 0.618033) * Math.PI * 2.0;
-            const phi = 0.15 + ((i * 0.381966) % 1.0) * (Math.PI * 0.42); // Solo hemisferio superior
-            const r = 98.0 + (i % 5) * 2.0;
+            const phi = 0.12 + ((i * 0.381966) % 1.0) * (Math.PI * 0.44); // Hemisferio superior
+            const r = 98.0 + (i % 6) * 1.8;
 
             const xs = this.centroOrbita.x + r * Math.sin(phi) * Math.cos(theta);
             const ys = this.centroOrbita.y + r * Math.cos(phi);
@@ -2455,7 +2828,11 @@ class SistemaCeleste extends Object3D {
             const meshEstrella = new Mesh(geomEstrella, matEstrella, 'Estrella');
             meshEstrella.position = { x: xs, y: ys, z: zs };
             this.add(meshEstrella);
-            this.estrellas.push({ mesh: meshEstrella, fase: i * 0.7 });
+            this.estrellas.push({
+                mesh: meshEstrella,
+                fase: i * 0.72,
+                escalaBase: 0.8 + ((i * 13) % 10) * 0.05
+            });
         }
 
         // Actualizar posiciones e iluminación inicial
@@ -2495,101 +2872,61 @@ class SistemaCeleste extends Object3D {
             this.angulo += diff * (1.0 - Math.exp(-3.5 * dt));
         }
 
+        // Rotación axial suave de los astros para mayor dinamismo
+        this.meshSol.rotation.y += 0.06 * dt;
+        this.meshLuna.rotation.y += 0.03 * dt;
+
         this.actualizarTransformaciones(dt);
     }
 
     actualizarTransformaciones(dt = 0) {
-        const R = this.radioOrbita;
-        const C = this.centroOrbita;
-        const ang = this.angulo;
+        // Cálculo fotométrico centralizado en Lighting.js
+        const ilum = calcularIluminacionCeleste(this.angulo, this.centroOrbita, this.radioOrbita);
 
-        // Órbita solar: de Este (+X) a Oeste (-X), cruzando hacia el sur
-        const solX = C.x + Math.cos(ang) * R;
-        const solY = C.y + Math.sin(ang) * R;
-        const solZ = C.z + Math.sin(ang * 0.5) * 16.0;
+        // 1. Posicionamiento y corona del Sol
+        const solPos = { x: ilum.datosSol.x, y: ilum.datosSol.y, z: ilum.datosSol.z };
+        this.meshSol.position = solPos;
+        this.meshHaloSol.position = solPos;
+        this.meshSol.visible = ilum.datosSol.visible;
+        this.meshHaloSol.visible = ilum.datosSol.visible;
 
-        this.meshSol.position = { x: solX, y: solY, z: solZ };
-        this.meshHaloSol.position = { x: solX, y: solY, z: solZ };
-        const solVisible = solY > -0.5;
-        this.meshSol.visible = solVisible;
-        this.meshHaloSol.visible = solVisible;
+        // El halo solar se expande y se tiñe de ámbar rojizo en la hora dorada (atardecer/amanecer)
+        const factorOcaso = ilum.datosSol.factorOcaso;
+        const escalaHaloSol = 1.0 + factorOcaso * 0.45;
+        this.meshHaloSol.scale = { x: escalaHaloSol, y: escalaHaloSol, z: escalaHaloSol };
+        const colorHaloDia = [1.0, 0.88, 0.38, 0.32];
+        const colorHaloOcaso = [1.0, 0.50, 0.18, 0.52];
+        this.meshHaloSol.material.color = lerpVec4(colorHaloDia, colorHaloOcaso, factorOcaso);
 
-        // Órbita lunar: exactamente opuesta al Sol (diferencia de PI)
-        const angLuna = ang + Math.PI;
-        const lunaX = C.x + Math.cos(angLuna) * R;
-        const lunaY = C.y + Math.sin(angLuna) * R;
-        const lunaZ = C.z + Math.sin(angLuna * 0.5) * 16.0;
+        // 2. Posicionamiento y corona de la Luna
+        const lunaPos = { x: ilum.datosLuna.x, y: ilum.datosLuna.y, z: ilum.datosLuna.z };
+        this.meshLuna.position = lunaPos;
+        this.meshHaloLuna.position = lunaPos;
+        this.meshLuna.visible = ilum.datosLuna.visible;
+        this.meshHaloLuna.visible = ilum.datosLuna.visible;
 
-        this.meshLuna.position = { x: lunaX, y: lunaY, z: lunaZ };
-        this.meshHaloLuna.position = { x: lunaX, y: lunaY, z: lunaZ };
-        const lunaVisible = lunaY > -0.5;
-        this.meshLuna.visible = lunaVisible;
-        this.meshHaloLuna.visible = lunaVisible;
+        // El halo lunar despliega su fulgor plateado al elevarse en la noche
+        const escalaHaloLuna = 1.0 + ilum.datosLuna.factorNoche * 0.22;
+        this.meshHaloLuna.scale = { x: escalaHaloLuna, y: escalaHaloLuna, z: escalaHaloLuna };
 
-        // Altura normalizada del Sol (-1 a +1)
-        const sinSol = Math.sin(ang);
-        // Factor de día: 1.0 (día pleno), 0.0 (noche plena)
-        const factorDia = clamp((sinSol + 0.15) / 0.55, 0.0, 1.0);
-        // Factor crepuscular / atardecer: pico cuando el sol está tocando el horizonte
-        const factorOcaso = Math.max(0.0, 1.0 - Math.abs(sinSol) * 3.5);
-
-        // Visibilidad y escala de estrellas según presencia solar
-        const visibilidadEstrellas = 1.0 - factorDia;
+        // 3. Estrellas titilantes en el firmamento
+        const visibilidadEstrellas = 1.0 - ilum.datosSol.factorDia;
         for (let i = 0; i < this.estrellas.length; i++) {
             const e = this.estrellas[i];
-            const titileo = 0.85 + 0.15 * Math.sin(ang * 6.0 + e.fase);
-            const s = visibilidadEstrellas * titileo;
+            const titileo = 0.82 + 0.18 * Math.sin(this.angulo * 7.0 + e.fase);
+            const s = visibilidadEstrellas * titileo * e.escalaBase;
             e.mesh.scale = { x: s, y: s, z: s };
-            e.mesh.visible = s > 0.05;
+            e.mesh.visible = s > 0.04;
         }
 
-        // Color del cielo (fondo de la escena)
-        const cieloDia = [0.46, 0.68, 0.90, 1.0];
-        const cieloOcaso = [0.82, 0.44, 0.32, 1.0];
-        const cieloNoche = [0.03, 0.04, 0.08, 1.0];
-
-        let cieloActual = lerpVec3(cieloNoche, cieloDia, factorDia);
-        cieloActual = lerpVec3(cieloActual, cieloOcaso, factorOcaso * 0.75);
-        this.scene.background = [cieloActual[0], cieloActual[1], cieloActual[2], 1.0];
-
-        // Dirección de la luz direccional principal (desde el astro visible hacia el centro)
-        let dirLuz;
-        if (solY > -5.0) {
-            const l = Math.hypot(solX, solY, solZ) || 1.0;
-            dirLuz = [-solX / l, -solY / l, -solZ / l];
-        } else {
-            const l = Math.hypot(lunaX, lunaY, lunaZ) || 1.0;
-            dirLuz = [-lunaX / l, -lunaY / l, -lunaZ / l];
-        }
-
-        // Color de la luz direccional
-        const luzSolDia = [0.98, 0.96, 0.92];
-        const luzSolOcaso = [1.0, 0.65, 0.35];
-        const luzLunaNoche = [0.22, 0.28, 0.42];
-
-        let colorLuzActual = lerpVec3(luzLunaNoche, luzSolDia, factorDia);
-        colorLuzActual = lerpVec3(colorLuzActual, luzSolOcaso, factorOcaso * 0.8);
-
-        // Color de luz ambiental
-        const ambientDia = [0.40, 0.42, 0.46];
-        const ambientOcaso = [0.32, 0.24, 0.26];
-        const ambientNoche = [0.07, 0.08, 0.12];
-
-        let ambientActual = lerpVec3(ambientNoche, ambientDia, factorDia);
-        ambientActual = lerpVec3(ambientActual, ambientOcaso, factorOcaso * 0.6);
-
-        // Intensidad de los focos dicroicos del edificio (se encienden de noche)
-        const intensFocos = lerp(4.8, 1.2, factorDia);
-
+        // 4. Actualización del fondo y de la iluminación en la escena
+        this.scene.background = ilum.background;
         this.scene.lighting = {
-            sunDirection: dirLuz,
-            sunColor: colorLuzActual,
-            ambientColor: ambientActual,
-            pointLights: focos.map(foco => ({
-                ...foco,
-                color: [1, 0.95, 0.82],
-                intensity: intensFocos
-            }))
+            sunDirection: ilum.sunDirection,
+            sunColor: ilum.sunColor,
+            ambientColor: ilum.ambientColor,
+            shadowIntensity: ilum.shadowIntensity,
+            pointLights: ilum.pointLights
         };
     }
 }
@@ -3523,6 +3860,57 @@ function generarTexturaLuna(gl) {
     return subirCanvasATextura(gl, c);
 }
 
+// ----------------------------------------------------------------------------
+// 20. SUPERFICIE SOLAR (Cromosfera incandescente, gránulos y limbo solar)
+// ----------------------------------------------------------------------------
+function generarTexturaSol(gl) {
+    const c = crearCanvasAuxiliar(1024, 512);
+    const ctx = c.getContext("2d");
+
+    // Base de plasma incandescente con gradiente de latitud
+    const gradBase = ctx.createLinearGradient(0, 0, 0, 512);
+    gradBase.addColorStop(0.0, "#ea580c"); // Limbo polar naranja rojizo
+    gradBase.addColorStop(0.25, "#f59e0b"); // Ámbar dorado
+    gradBase.addColorStop(0.50, "#ffffff"); // Núcleo ecuatorial blanco incandescente
+    gradBase.addColorStop(0.75, "#f59e0b"); // Ámbar dorado
+    gradBase.addColorStop(1.0, "#ea580c"); // Limbo polar naranja rojizo
+    ctx.fillStyle = gradBase;
+    ctx.fillRect(0, 0, 1024, 512);
+
+    // Gránulos de convección fotosférica (micro-células térmicas)
+    ctx.fillStyle = "rgba(255, 255, 255, 0.22)";
+    for (let i = 0; i < 180; i++) {
+        const x = (i * 73) % 1024;
+        const y = 30 + ((i * 47) % 452);
+        const rx = 16 + ((i * 13) % 26);
+        const ry = 9 + ((i * 7) % 16);
+        ctx.beginPath();
+        ctx.ellipse(x, y, rx, ry, i * 0.35, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Filamentos de fulgor y llamaradas cromosféricas
+    ctx.fillStyle = "rgba(251, 146, 60, 0.35)";
+    for (let i = 0; i < 90; i++) {
+        const x = (i * 109) % 1024;
+        const y = 20 + ((i * 61) % 472);
+        const r = 8 + ((i * 5) % 16);
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Cinturón ecuatorial de radiación intensa (efecto de súper-brillo central)
+    const gradCentro = ctx.createLinearGradient(0, 150, 0, 362);
+    gradCentro.addColorStop(0.0, "rgba(255, 255, 255, 0.0)");
+    gradCentro.addColorStop(0.5, "rgba(255, 255, 255, 0.70)");
+    gradCentro.addColorStop(1.0, "rgba(255, 255, 255, 0.0)");
+    ctx.fillStyle = gradCentro;
+    ctx.fillRect(0, 150, 1024, 212);
+
+    return subirCanvasATextura(gl, c);
+}
+
 function crearTexturasEdificio(gl) {
     return {
         vidrioAzul: generarTexturaVidrioAzul(gl),
@@ -3543,7 +3931,8 @@ function crearTexturasEdificio(gl) {
         letreroCochera: generarTexturaLetreroCochera(gl),
         cespedMontana: generarTexturaCespedMontana(gl),
         cortezaArbol: generarTexturaCorteza(gl),
-        luna: generarTexturaLuna(gl)
+        luna: generarTexturaLuna(gl),
+        sol: generarTexturaSol(gl)
     };
 }
 

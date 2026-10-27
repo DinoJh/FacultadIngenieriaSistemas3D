@@ -888,6 +888,57 @@ function generarTexturaLuna(gl) {
     return subirCanvasATextura(gl, c);
 }
 
+// ----------------------------------------------------------------------------
+// 20. SUPERFICIE SOLAR (Cromosfera incandescente, gránulos y limbo solar)
+// ----------------------------------------------------------------------------
+function generarTexturaSol(gl) {
+    const c = crearCanvasAuxiliar(1024, 512);
+    const ctx = c.getContext("2d");
+
+    // Base de plasma incandescente con gradiente de latitud
+    const gradBase = ctx.createLinearGradient(0, 0, 0, 512);
+    gradBase.addColorStop(0.0, "#ea580c"); // Limbo polar naranja rojizo
+    gradBase.addColorStop(0.25, "#f59e0b"); // Ámbar dorado
+    gradBase.addColorStop(0.50, "#ffffff"); // Núcleo ecuatorial blanco incandescente
+    gradBase.addColorStop(0.75, "#f59e0b"); // Ámbar dorado
+    gradBase.addColorStop(1.0, "#ea580c"); // Limbo polar naranja rojizo
+    ctx.fillStyle = gradBase;
+    ctx.fillRect(0, 0, 1024, 512);
+
+    // Gránulos de convección fotosférica (micro-células térmicas)
+    ctx.fillStyle = "rgba(255, 255, 255, 0.22)";
+    for (let i = 0; i < 180; i++) {
+        const x = (i * 73) % 1024;
+        const y = 30 + ((i * 47) % 452);
+        const rx = 16 + ((i * 13) % 26);
+        const ry = 9 + ((i * 7) % 16);
+        ctx.beginPath();
+        ctx.ellipse(x, y, rx, ry, i * 0.35, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Filamentos de fulgor y llamaradas cromosféricas
+    ctx.fillStyle = "rgba(251, 146, 60, 0.35)";
+    for (let i = 0; i < 90; i++) {
+        const x = (i * 109) % 1024;
+        const y = 20 + ((i * 61) % 472);
+        const r = 8 + ((i * 5) % 16);
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Cinturón ecuatorial de radiación intensa (efecto de súper-brillo central)
+    const gradCentro = ctx.createLinearGradient(0, 150, 0, 362);
+    gradCentro.addColorStop(0.0, "rgba(255, 255, 255, 0.0)");
+    gradCentro.addColorStop(0.5, "rgba(255, 255, 255, 0.70)");
+    gradCentro.addColorStop(1.0, "rgba(255, 255, 255, 0.0)");
+    ctx.fillStyle = gradCentro;
+    ctx.fillRect(0, 150, 1024, 212);
+
+    return subirCanvasATextura(gl, c);
+}
+
 export function crearTexturasEdificio(gl) {
     return {
         vidrioAzul: generarTexturaVidrioAzul(gl),
@@ -908,6 +959,7 @@ export function crearTexturasEdificio(gl) {
         letreroCochera: generarTexturaLetreroCochera(gl),
         cespedMontana: generarTexturaCespedMontana(gl),
         cortezaArbol: generarTexturaCorteza(gl),
-        luna: generarTexturaLuna(gl)
+        luna: generarTexturaLuna(gl),
+        sol: generarTexturaSol(gl)
     };
 }

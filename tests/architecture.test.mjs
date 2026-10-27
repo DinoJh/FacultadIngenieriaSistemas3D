@@ -16,6 +16,7 @@ import { SphereGeometry } from '../js/geometries/SphereGeometry.js';
 import { StairGeometry } from '../js/geometries/StairGeometry.js';
 import { TrapezoidGeometry } from '../js/geometries/TrapezoidGeometry.js';
 import { MountainGeometry, calcularAlturaMontana } from '../js/geometries/MountainGeometry.js';
+import { calcularIluminacionCeleste, actualizarIluminacion, focos } from '../js/scenes/Lighting.js';
 
 test('Los hijos heredan posición, rotación y escala; se pueden reasignar de padre', () => {
     const parent = new Object3D();
@@ -141,4 +142,34 @@ test('La cámara actualiza perspectiva y respeta la posición mundial del padre'
     camera.aspect = 2;
     camera.updateProjectionMatrix();
     assert.ok(Math.abs(camera.projectionMatrix[0] - before / 2) < 1e-6);
+});
+
+test('El modelo fotométrico de iluminación solar y lunar calcula transiciones físicas realistas', () => {
+    // 1. Mediodía (Sol en cenit): luz intensa, cielo azul, focos dicroicos atenuados
+    const mediodia = calcularIluminacionCeleste(Math.PI * 0.5);
+    assert.ok(mediodia.sunColor[0] >= 1.0, 'La luz solar cenital debe ser brillante');
+    assert.ok(mediodia.ambientColor[0] > 0.30, 'El ambiente diurno debe tener alta luminosidad');
+    assert.ok(mediodia.background[2] > 0.70, 'El cielo cenital debe ser azul brillante');
+    assert.ok(mediodia.pointLights[0].intensity < 2.0, 'Las luces de edificios deben ser tenues de día');
+
+    // 2. Ocaso / Atardecer (Hora dorada): dispersión de Rayleigh con tonos ámbar y cielo cálido
+    const ocaso = calcularIluminacionCeleste(Math.PI);
+    assert.ok(ocaso.datosSol.factorOcaso > 0.8, 'El factor de ocaso debe activarse en el horizonte');
+    assert.ok(ocaso.sunColor[0] > ocaso.sunColor[2] * 2.0, 'La luz solar de ocaso debe ser fuertemente cálida (rojo > azul)');
+    assert.ok(ocaso.background[0] > 0.60, 'El cielo de ocaso debe tener tonalidad cálida');
+
+    // 3. Medianoche (Luna en cenit): luz plateada clara, visibilidad nocturna y focos cálidos
+    const medianoche = calcularIluminacionCeleste(Math.PI * 1.5);
+    assert.ok(medianoche.sunColor[2] > medianoche.sunColor[0], 'La luz lunar debe ser plateada-azulada fría (azul > rojo)');
+    assert.ok(medianoche.sunColor[0] < 0.60, 'La intensidad lunar directa debe ser clara pero no cegadora');
+    assert.ok(medianoche.ambientColor[0] >= 0.18, 'El ambiente nocturno debe ser visible y no oscuro');
+    assert.ok(medianoche.background[0] < 0.10, 'El cielo nocturno debe ser azul índigo');
+    assert.ok(medianoche.pointLights[0].intensity > 4.0, 'Los focos dicroicos deben alcanzar máxima intensidad nocturna');
+});
+
+test('BasicMaterial soporta control de depthWrite para halos transparentes', () => {
+    const matSolido = new BasicMaterial();
+    assert.equal(matSolido.depthWrite, true);
+    const matHalo = new BasicMaterial({ depthWrite: false });
+    assert.equal(matHalo.depthWrite, false);
 });

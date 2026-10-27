@@ -188,6 +188,20 @@ function matrizNormal3x3(m4) {
     ]);
 }
 
+// Matriz de proyección ortográfica (para mapas de sombras y vistas paralelas)
+function ortografica(left, right, bottom, top, near, far) {
+    const lr = 1.0 / (left - right);
+    const bt = 1.0 / (bottom - top);
+    const nf = 1.0 / (near - far);
+
+    return new Float32Array([
+        -2.0 * lr, 0, 0, 0,
+        0, -2.0 * bt, 0, 0,
+        0, 0, 2.0 * nf, 0,
+        (left + right) * lr, (top + bottom) * bt, (far + near) * nf, 1
+    ]);
+}
+
 /** Operaciones matriciales del mini motor (Paso 16). */
 export class Matrix4 {
     static identidad(...args) { return matrizIdentidad(...args); }
@@ -199,6 +213,7 @@ export class Matrix4 {
     static rotacionZ(...args) { return rotacionZ(...args); }
     static lookAt(...args) { return lookAt(...args); }
     static perspectiva(...args) { return perspectiva(...args); }
+    static ortografica(...args) { return ortografica(...args); }
     static normal3x3(...args) { return matrizNormal3x3(...args); }
     static compose(position, rotation, scale) {
         const T = traslacion(position.x, position.y, position.z);
