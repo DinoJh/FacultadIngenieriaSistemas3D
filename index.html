@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Recreación 3D - Escuela Profesional de Ingeniería de Sistemas | UNA Puno</title>
+    <meta name="description" content="Recreación tridimensional e interactiva en WebGL2 de la Escuela Profesional de Ingeniería de Sistemas de la Universidad Nacional del Altiplano Puno.">
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <!-- Canvas WebGL2 a pantalla completa -->
+    <div id="canvas-container">
+        <canvas id="glCanvas"></canvas>
+    </div>
+
+    <!-- Encabezado con información del proyecto y del estudiante -->
+    <header class="header-overlay">
+        <div class="institution-logo">IS</div>
+        <div class="header-content">
+            <h1>ESCUELA PROFESIONAL DE INGENIERÍA DE SISTEMAS</h1>
+            <div class="subtitle">
+                <span>UNA Puno &bull; Computación Gráfica 2026-II</span>
+                <span class="student-badge">Dino Jhoel Condori Churata (Cód. 236262)</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- Telemetría HUD en tiempo real -->
+    <aside class="hud-telemetry" aria-label="Telemetría de la escena">
+        <div class="hud-pill">
+            <span class="hud-label">Rendimiento</span>
+            <span class="hud-value hud-fps" id="hudFps">60 FPS</span>
+        </div>
+        <div class="hud-pill">
+            <span class="hud-label">Distancia</span>
+            <span class="hud-value" id="hudDist">22.0 m</span>
+        </div>
+        <div class="hud-pill">
+            <span class="hud-label">Azimut / Elev.</span>
+            <span class="hud-value"><span id="hudAzi">5°</span> / <span id="hudEle">13°</span></span>
+        </div>
+    </aside>
+
+    <!-- Contenedor del Menú de Controles Flotante (Un único botón que despliega todos los controles) -->
+    <div class="controls-wrapper" id="controlsWrapper">
+        <!-- Panel desplegable con todos los botones organizados por categorías -->
+        <nav class="controls-popover" id="controlsPopover" aria-label="Panel de controles y opciones">
+            <div class="popover-header">
+                <div class="popover-title">
+                    <span class="popover-icon">🎛️</span>
+                    <span>Panel de Control 3D</span>
+                </div>
+                <button class="btn-close-popover" data-action="toggleMenuControles" title="Cerrar panel">✕</button>
+            </div>
+
+            <div class="popover-body">
+                <!-- Vistas predefinidas -->
+                <div class="popover-section">
+                    <span class="popover-section-label">📐 Vistas de Cámara</span>
+                    <div class="popover-buttons-grid">
+                        <button class="btn-control" id="btnFrontal" data-action="vistaFrontal" title="Vista frontal idéntica a las fotos reales">
+                            🏛️ Frontal
+                        </button>
+                        <button class="btn-control" id="btnLateral" data-action="vistaLateralDerecha" title="Vista angular derecha con ladera">
+                            📐 Lateral Der.
+                        </button>
+                        <button class="btn-control" id="btnAzotea" data-action="vistaAzotea" title="Vista de la nueva azotea con casetón">
+                            🏢 Azotea
+                        </button>
+                        <button class="btn-control" id="btnPosterior" data-action="vistaPosterior" title="Vista de la fachada posterior">
+                            🔄 Posterior
+                        </button>
+                        <button class="btn-control" id="btnAerea" data-action="vistaPerspectivaAerea" title="Vista panorámica aérea">
+                            🛰️ Panorámica
+                        </button>
+                        <button class="btn-control" id="btnEntrada" data-action="vistaEntradaEscalinata" title="Vista en primer plano de la escalinata">
+                            🚪 Entrada
+                        </button>
+                        <button class="btn-control" id="btnBosque" data-action="vistaBosque" title="Vista panorámica de la montaña y bosque posterior">
+                            🌲 Cerro / Bosque
+                        </button>
+                        <button class="btn-control" id="btnReset" data-action="restablecerCamara" title="Restablecer vista inicial (Tecla R)">
+                            🎯 Restablecer (R)
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Acciones interactivas -->
+                <div class="popover-section">
+                    <span class="popover-section-label">⚡ Interacciones y Entorno</span>
+                    <div class="popover-buttons-grid">
+                        <button class="btn-control btn-action" id="btnPuertas" data-action="alternarPuertas" title="Abrir o cerrar puertas de la entrada (Tecla E)">
+                            🚪 Abrir Puertas (E)
+                        </button>
+                        <button class="btn-control btn-action activo" id="btnVentanas" data-action="alternarVentanas" title="Abrir o cerrar ventanas proyectantes de la torre (Tecla V)">
+                            🪟 Ventanas (V)
+                        </button>
+                        <button class="btn-control btn-action" id="btnLuz" data-action="alternarLuzNocturna" title="Alternar entre iluminación diurna y nocturna (Tecla L)">
+                            🌙 Modo Noche (L)
+                        </button>
+                        <button class="btn-control btn-action" id="btnAutoOrbit" data-action="alternarAutoOrbit" title="Recorrido cinemático automático 360° (Tecla C)">
+                            🔄 Giro Cinemático (C)
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Botón de Guía y Rúbricas -->
+                <div class="popover-section">
+                    <button class="btn-control btn-guia-wide" id="btnGuia" data-action="toggleModalGuia" title="Ver fundamentación matemática y rúbrica">
+                        📘 Guía Técnica y Rúbricas WebGL2
+                    </button>
+                </div>
+
+                <!-- Atajos de teclado rápidos -->
+                <div class="keyboard-hints">
+                    <span><span class="key-tag">WASD / Mouse</span> Orbitar</span>
+                    <span><span class="key-tag">Rueda / Q</span> Zoom</span>
+                    <span><span class="key-tag">E</span> Puertas</span>
+                    <span><span class="key-tag">V</span> Ventanas</span>
+                    <span><span class="key-tag">L</span> Día/Noche</span>
+                    <span><span class="key-tag">K</span> Ciclo Sol/Luna</span>
+                    <span><span class="key-tag">C</span> Cinemática</span>
+                    <span><span class="key-tag">R</span> Reset</span>
+                </div>
+            </div>
+        </nav>
+
+        <!-- El ÚNICO BOTÓN PRINCIPAL flotante que ve el usuario -->
+        <button class="btn-menu-trigger" id="btnMenuTrigger" data-action="toggleMenuControles" title="Mostrar u ocultar opciones y controles">
+            <span class="trigger-icon" id="triggerIcon">🎛️</span>
+            <span class="trigger-text" id="triggerText">Controles y Vistas</span>
+            <span class="trigger-arrow" id="triggerArrow">▲</span>
+        </button>
+    </div>
+
+    <!-- Modal: Guía Técnica y Fundamentación para la Evaluación -->
+    <div class="modal-backdrop" id="modalGuia">
+        <div class="modal-card">
+            <div class="modal-header">
+                <div class="modal-title">
+                    <span>🏛️</span>
+                    <span>Fundamentación Técnica y Rúbricas WebGL2</span>
+                </div>
+                <button class="btn-close" data-action="toggleModalGuia" title="Cerrar">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="doc-section">
+                    <h3>📐 1. Transformaciones y Matrices 4x4 (Pasos 5 y 6)</h3>
+                    <p>
+                        Todas las geometrías se posicionan en el espacio mediante la composición de matrices:
+                        <span class="code-pill">M = T * R * S</span>.
+                        La vista y la proyección se calculan en <span class="code-pill">js/math/Matrix4.js</span> con
+                        <span class="code-pill">lookAt(eye, target, up)</span> y <span class="code-pill">perspectiva(fov, aspect, near, far)</span>
+                        en orden columna mayor estándar de WebGL2.
+                    </p>
+                </div>
+
+                <div class="doc-section">
+                    <h3>⏱️ 2. Animación y Render Loop (Paso 4)</h3>
+                    <p>
+                        Se utiliza <span class="code-pill">requestAnimationFrame(render)</span> continuo con cálculo estricto de
+                        <span class="code-pill">deltaTime = (tiempoMs - tiempoAnterior) * 0.001</span>.
+                        Esto garantiza que la rotación de las puertas de vidrio, la apertura basculante de las ventanas proyectantes en 3D
+                        y el giro cinemático de la cámara sean completamente fluidos e independientes de los FPS del monitor.
+                    </p>
+                </div>
+
+                <div class="doc-section">
+                    <h3>💡 3. Iluminación y Shaders GLSL ES 3.00 (Pasos 8, 12 y 13)</h3>
+                    <p>
+                        El fragment shader implementa el modelo de iluminación <strong>Blinn-Phong</strong> con:
+                        componente ambiental, luz solar direccional y <strong>siete luces locales cálidas</strong> distribuidas en los aleros,
+                        con intensidad que disminuye según la distancia y el radio de influencia.
+                        Las normales se transforman con la matriz normal inversa-transpuesta 3x3.
+                    </p>
+                </div>
+
+                <div class="doc-section">
+                    <h3>🎨 4. Texturizado Procedimental (Pasos 9 y 10)</h3>
+                    <p>
+                        Las texturas del muro cortina azul, piedra laja, letrero verde institucional, alucobond y parasoles se generan
+                        mediante Canvas 2D en memoria. El código fuente está organizado en <strong>módulos ES</strong>.
+                        La versión empaquetada permite abrir este HTML directamente con doble clic.
+                    </p>
+                </div>
+
+                <div class="doc-section">
+                    <h3>🎮 5. Navegación de Cámara Orbital Interactiva (Paso 15)</h3>
+                    <p>
+                        La cámara orbitante se modela en coordenadas esféricas (<span class="code-pill">azimut</span>,
+                        <span class="code-pill">elevación</span>, <span class="code-pill">distancia</span>) convertidas en cada frame
+                        a coordenadas cartesianas mediante funciones trigonométricas con amortiguación suave (damping)
+                        para una experiencia fluida.
+                    </p>
+                </div>
+                <div class="doc-section">
+                    <h3>🏗️ 6. Mini Motor Gráfico (Paso 16)</h3>
+                    <p>La escena es un árbol de <span class="code-pill">Object3D</span>.
+                        Cada <span class="code-pill">Mesh</span> combina geometría, material y transformación.
+                        Las puertas y ventanas heredan las transformaciones de sus bisagras.
+                        <span class="code-pill">Renderer.render(scene, camera)</span> recorre el árbol
+                        y concentra las llamadas a WebGL2.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Mini motor modular empaquetado para funcionar también con doble clic. -->
+    <script src="js/app.bundle.js"></script>
+</body>
+</html>
